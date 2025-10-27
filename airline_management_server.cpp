@@ -48,16 +48,17 @@ struct ServerData
     vector<User> users;
     vector<Flight> flights;
     vector<Reservation> reservations;
-    map<int, User*> client_users;
+    map<int, string> client_users;
 };
 
 void handleClientMessage(int client_socket, ServerData& data);
 string handleListFlights(const ServerData& data);
 int countAvailableSeats(const Flight& flight);
 string handleRegister(ServerData& data, const string& command);
-string handleLogin(ServerData& data, User*& logged_in_user, const string& command);
-string handleAddFlight(ServerData& data, const string& command, const User* logged_in_user);
-void sendUDPBroadcast(const ServerData& data, const string& message);
+User* getUserByUsername(ServerData& data, const string& username);
+string handleLogin(ServerData& data, int client_socket, const string& command);
+string handleAddFlight(ServerData& data, const string& command, const string& username);
+void sendUDPBroadcast(ServerData& data, const string& message);
 
 int main(int argc, char* argv[])
 {
@@ -104,7 +105,7 @@ int main(int argc, char* argv[])
                 FD_SET(client_socket, &master_fds);
                 if (client_socket > max_fd) max_fd = client_socket;
                 
-                data.client_users[client_socket] = nullptr;
+                data.client_users[client_socket] = "";
             }
 
             else
@@ -151,18 +152,21 @@ void handleClientMessage(int client_socket, ServerData& data)
 
     else if (command.find("LOGIN") != string::npos)
     {
-        response = handleLogin(data, data.client_users[client_socket], command);
+        response = handleLogin(data, client_socket, command);
     }
 
     else if (command.find("ADD_FLIGHT") != string::npos)
     {
-        if (data.client_users[client_socket] == nullptr)
+        string username = data.client_users[client_socket];
+
+        if (username.empty())
         {
             response = "ERROR NotLoggedIn";
         }
+
         else
         {
-            response = handleAddFlight(data, command, data.client_users[client_socket]);
+            response = handleAddFlight(data, command, username);
         }
     }
 
@@ -233,35 +237,55 @@ string handleRegister(ServerData& data, const string& command)
     return "REGISTERED OK";
 }
 
-string handleLogin(ServerData& data, User*& logged_in_user, const string& command)
+User* getUserByUsername(ServerData& data, const string& username)
+{
+    for (auto& user : data.users)
+    {
+        if (user.username == username)
+        {
+            return &user;
+        }
+    }
+
+    return nullptr;
+}
+
+string handleLogin(ServerData& data, int client_socket, const string& command)
 {
     stringstream ss(command);
     string cmd, username, password;
     ss >> cmd >> username >> password;
 
-    for (auto& user : data.users)
+    User* user = getUserByUsername(data, username);
+    
+    if (user == nullptr)
     {
-        if (user.username == username)
+        return "ERROR UserNotFound";
+    }
+    
+    if (user->password != password)
+    {
+        return "ERROR InvalidPassword";
+    }
+    
+    for (const auto& [socket, logged_username] : data.client_users)
+    {
+        if (socket != client_socket && logged_username == username)
         {
-            if (user.password == password)
-            {
-                logged_in_user = &user;
-                return "LOGIN OK";
-            }
-
-            else
-            {
-                return "ERROR InvalidPassword";
-            }
+            return "ERROR UserAlreadyLoggedIn";
         }
     }
     
-    return "ERROR UserNotFound";
+    data.client_users[client_socket] = username;
+
+    return "LOGIN OK";
 }
 
-string handleAddFlight(ServerData& data, const string& command, const User* logged_in_user)
+string handleAddFlight(ServerData& data, const string& command, const string& username)
 {
-    if (logged_in_user->role != AIRLINE)
+    User* user = getUserByUsername(data, username);
+    
+    if (user == nullptr || user->role != AIRLINE)
     {
         return "ERROR PermissionDenied";
     }
@@ -296,7 +320,7 @@ string handleAddFlight(ServerData& data, const string& command, const User* logg
     return "FLIGHT_ADDED OK";
 }
 
-void sendUDPBroadcast(const ServerData& data, const string& message)
+void sendUDPBroadcast(ServerData& data, const string& message)
 {
     int udp_socket = socket(AF_INET, SOCK_DGRAM, 0);
     
@@ -310,8 +334,10 @@ void sendUDPBroadcast(const ServerData& data, const string& message)
     bool is_new_user = (message.find("NEW_USER") != string::npos);
     bool is_new_flight = (message.find("NEW_FLIGHT") != string::npos);
     
-    for (const auto& [client_socket, user_ptr] : data.client_users)
+    for (const auto& [client_socket, username] : data.client_users)
     {
+        User* user_ptr = getUserByUsername(data, username);
+
         if (user_ptr == nullptr) continue;
         
         if (is_new_user && user_ptr->role == AIRLINE)
