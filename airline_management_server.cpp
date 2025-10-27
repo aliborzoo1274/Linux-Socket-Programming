@@ -1,5 +1,6 @@
 #include <iostream>
 #include <cstring>
+#include <algorithm>
 #include <vector>
 #include <sstream>
 #include <unistd.h>
@@ -8,10 +9,13 @@
 #include <arpa/inet.h>
 #include <sys/select.h>
 #include <map>
+#include <ctime>
+#include <signal.h>
 
 using namespace std;
 
 #define BUFFER_SIZE 1024
+#define RESERVATION_TIMEOUT 30
 
 enum UserType { CUSTOMER, AIRLINE };
 enum SeatStatus { FREE, RESERVED };
@@ -30,7 +34,7 @@ struct Flight
     string origin;
     string destination;
     string time;
-    vector<SeatStatus> seat_map;
+    vector<vector<SeatStatus>> seat_map;
 };
 
 struct Reservation
@@ -38,7 +42,7 @@ struct Reservation
     string reservation_id;
     string flight_id;
     string username;
-    vector<int> seats;
+    vector<string> seats;
     ReservationStatus status;
     time_t timestamp;
 };
@@ -49,7 +53,11 @@ struct ServerData
     vector<Flight> flights;
     vector<Reservation> reservations;
     map<int, string> client_users;
+    int next_reservation_id;
+    ServerData() : next_reservation_id(1) {}
 };
+
+ServerData* g_data = nullptr;
 
 void handleClientMessage(int client_socket, ServerData& data);
 string handleListFlights(const ServerData& data);
@@ -59,10 +67,34 @@ User* getUserByUsername(ServerData& data, const string& username);
 string handleLogin(ServerData& data, int client_socket, const string& command);
 string handleAddFlight(ServerData& data, const string& command, const string& username);
 void sendUDPBroadcast(ServerData& data, const string& message);
+string handleReserve(ServerData& data, const string& command, int client_socket);
+string handleConfirm(ServerData& data, const string& command, int client_socket);
+string handleCancel(ServerData& data, const string& command, int client_socket);
+int parseAndValidateSeats(const Flight& flight, const vector<string>& seat_codes, vector<string>& validated_seats);
+void checkExpiredReservations(ServerData& data);
+
+void alarm_handler(int sig)
+{
+    if (g_data != nullptr)
+    {
+        checkExpiredReservations(*g_data);
+        alarm(5);
+    }
+}
 
 int main(int argc, char* argv[])
 {
     ServerData data;
+    g_data = &data;
+    
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = alarm_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGALRM, &sa, NULL);
+
+    alarm(5);
 
     int port = stoi(argv[1]);
     int server_socket = socket(AF_INET, SOCK_STREAM, 0);
@@ -90,7 +122,13 @@ int main(int argc, char* argv[])
     {
         read_fds = master_fds;
         
-        select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+        int activity = select(max_fd + 1, &read_fds, NULL, NULL, NULL);
+        
+        if (activity < 0)
+        {
+            if (errno == EINTR) continue;
+            break;
+        }
 
         for (int fd = 0; fd <= max_fd; fd++)
         {
@@ -170,6 +208,21 @@ void handleClientMessage(int client_socket, ServerData& data)
         }
     }
 
+    else if (command.find("RESERVE") != string::npos)
+    {
+        response = handleReserve(data, command, client_socket);
+    }
+
+    else if (command.find("CONFIRM") != string::npos)
+    {
+        response = handleConfirm(data, command, client_socket);
+    }
+
+    else if (command.find("CANCEL") != string::npos)
+    {
+        response = handleCancel(data, command, client_socket);
+    }
+
     else
     {
         response = "ERROR UnknownCommand";
@@ -191,7 +244,7 @@ string handleListFlights(const ServerData& data)
     for (const auto& flight : data.flights)
     {
         int available = countAvailableSeats(flight);
-        int total = flight.seat_map.size();
+        int total = flight.seat_map.size() * (flight.seat_map.empty() ? 0 : flight.seat_map[0].size());
         response << "FLIGHT " << flight.flight_id << " "
                  << flight.origin << " " << flight.destination << " "
                  << flight.time << " SEATS_AVAILABLE=" << available << "/" << total;
@@ -203,9 +256,12 @@ string handleListFlights(const ServerData& data)
 int countAvailableSeats(const Flight& flight)
 {
     int available = 0;
-    for (const auto& seat : flight.seat_map)
+    for (const auto& row : flight.seat_map)
     {
-        if (seat == FREE) available++;
+        for (const auto& seat : row)
+        {
+            if (seat == FREE) available++;
+        }
     }
     return available;
 }
@@ -309,8 +365,7 @@ string handleAddFlight(ServerData& data, const string& command, const string& us
     new_flight.destination = destination;
     new_flight.time = time;
     
-    int total_seats = column_count * row_count;
-    new_flight.seat_map = vector<SeatStatus>(total_seats, FREE);
+    new_flight.seat_map = vector<vector<SeatStatus>>(row_count, vector<SeatStatus>(column_count, FREE));
     
     data.flights.push_back(new_flight);
     
@@ -366,4 +421,219 @@ void sendUDPBroadcast(ServerData& data, const string& message)
     }
     
     close(udp_socket);
+}
+
+string handleReserve(ServerData& data, const string& command, int client_socket)
+{
+    string username = data.client_users[client_socket];
+
+    if (username.empty())
+    {
+        return "ERROR NotLoggedIn";
+    }
+    
+    User* user = getUserByUsername(data, username);
+
+    if (user == nullptr || user->role != CUSTOMER)
+    {
+        return "ERROR PermissionDenied";
+    }
+    
+    stringstream ss(command);
+    string cmd, flight_id;
+    ss >> cmd >> flight_id;
+    
+    Flight* target_flight = nullptr;
+    for (auto& flight : data.flights)
+    {
+        if (flight.flight_id == flight_id)
+        {
+            target_flight = &flight;
+            break;
+        }
+    }
+    
+    if (target_flight == nullptr)
+    {
+        return "ERROR FlightNotFound";
+    }
+    
+    vector<string> seat_codes;
+    string seat_code;
+    while (ss >> seat_code)
+    {
+        seat_codes.push_back(seat_code);
+    }
+    
+    if (seat_codes.empty())
+    {
+        return "ERROR NoSeatsSpecified";
+    }
+    
+    vector<string> validated_seats;
+    int result = parseAndValidateSeats(*target_flight, seat_codes, validated_seats);
+    
+    if (result == -1) return "ERROR InvalidSeatFormat";
+    if (result == -2) return "ERROR SeatNotAvailable";
+    
+    for (const string& seat : validated_seats)
+    {
+        char column = seat[0];
+        int row = stoi(seat.substr(1)) - 1;
+        int col = column - 'A';
+        target_flight->seat_map[row][col] = RESERVED;
+    }
+    
+    Reservation reservation;
+    reservation.reservation_id = "R" + to_string(data.next_reservation_id++);
+    reservation.flight_id = flight_id;
+    reservation.username = username;
+    reservation.seats = validated_seats;
+    reservation.status = TEMPORARY;
+    reservation.timestamp = time(nullptr);
+    
+    data.reservations.push_back(reservation);
+    
+    return "RESERVED TEMP " + reservation.reservation_id + " EXPIRES_IN 30";
+}
+
+string handleConfirm(ServerData& data, const string& command, int client_socket)
+{
+    string username = data.client_users[client_socket];
+
+    if (username.empty())
+    {
+        return "ERROR NotLoggedIn";
+    }
+    
+    stringstream ss(command);
+    string cmd, reservation_id;
+    ss >> cmd >> reservation_id;
+    
+    for (auto& reservation : data.reservations)
+    {
+        if (reservation.reservation_id == reservation_id)
+        {
+            if (reservation.username != username)
+            {
+                return "ERROR NotYourReservation";
+            }
+            
+            time_t now = time(nullptr);
+
+            if (difftime(now, reservation.timestamp) > RESERVATION_TIMEOUT)
+            {
+                return "ERROR ReservationExpired";
+            }
+            
+            reservation.status = CONFIRMED;
+            return "CONFIRMATION OK";
+        }
+    }
+    
+    return "ERROR ReservationNotFound";
+}
+
+string handleCancel(ServerData& data, const string& command, int client_socket)
+{
+    string username = data.client_users[client_socket];
+
+    if (username.empty())
+    {
+        return "ERROR NotLoggedIn";
+    }
+    
+    stringstream ss(command);
+    string cmd, reservation_id;
+    ss >> cmd >> reservation_id;
+    
+    for (size_t i = 0; i < data.reservations.size(); i++)
+    {
+        if (data.reservations[i].reservation_id == reservation_id)
+        {
+            if (data.reservations[i].username != username)
+            {
+                return "ERROR NotYourReservation";
+            }
+            
+            for (auto& flight : data.flights)
+            {
+                if (flight.flight_id == data.reservations[i].flight_id)
+                {
+                    for (const string& seat : data.reservations[i].seats)
+                    {
+                        char column = seat[0];
+                        int row = stoi(seat.substr(1)) - 1;
+                        int col = column - 'A';
+                        flight.seat_map[row][col] = FREE;
+                    }
+                    break;
+                }
+            }
+            
+            data.reservations.erase(data.reservations.begin() + i);
+            return "CANCELED OK";
+        }
+    }
+    
+    return "ERROR ReservationNotFound";
+}
+
+int parseAndValidateSeats(const Flight& flight, const vector<string>& seat_codes, vector<string>& validated_seats)
+{
+    int row_count = flight.seat_map.size();
+    int column_count = flight.seat_map.empty() ? 0 : flight.seat_map[0].size();
+    
+    for (const string& code : seat_codes)
+    {
+        if (code.length() < 2) return -1;
+        
+        char column = code[0];
+        if (column < 'A' || column > 'Z') return -1;
+        
+        int row = stoi(code.substr(1)) - 1;
+        int col = column - 'A';
+        
+        if (row < 0 || row >= row_count || col < 0 || col >= column_count) return -1;
+        
+        if (flight.seat_map[row][col] != FREE) return -2;
+        
+        validated_seats.push_back(code);
+    }
+    
+    return 0;
+}
+
+void checkExpiredReservations(ServerData& data)
+{
+    time_t now = time(nullptr);
+    
+    for (size_t i = 0; i < data.reservations.size(); )
+    {
+        if (data.reservations[i].status == TEMPORARY &&
+            difftime(now, data.reservations[i].timestamp) > RESERVATION_TIMEOUT)
+        {
+            for (auto& flight : data.flights)
+            {
+                if (flight.flight_id == data.reservations[i].flight_id)
+                {
+                    for (const string& seat : data.reservations[i].seats)
+                    {
+                        char column = seat[0];
+                        int row = stoi(seat.substr(1)) - 1;
+                        int col = column - 'A';
+                        flight.seat_map[row][col] = FREE;
+                    }
+                    break;
+                }
+            }
+            
+            data.reservations.erase(data.reservations.begin() + i);
+        }
+        
+        else
+        {
+            i++;
+        }
+    }
 }
