@@ -149,3 +149,9 @@ Top-level files:
 - [Makefile](https://github.com/aliborzoo1274/Linux-Socket-Programming/blob/cf433a96d6e8ff2325f048bc99c7b9eb225da95c/Makefile) — builds `server.out` and `client.out`
 - [airline_management_server.cpp](https://github.com/aliborzoo1274/Linux-Socket-Programming/blob/cf433a96d6e8ff2325f048bc99c7b9eb225da95c/airline_management_server.cpp) — server implementation (TCP + UDP notifications, reservation logic)
 - [airline_management_client.cpp](https://github.com/aliborzoo1274/Linux-Socket-Programming/blob/cf433a96d6e8ff2325f048bc99c7b9eb225da95c/airline_management_client.cpp) — interactive client with UDP listener thread
+
+---
+
+## 👤 Author
+
+**Ali Borzoozadeh** ([@aliborzoo1274](https://github.com/aliborzoo1274))
